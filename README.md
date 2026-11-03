@@ -16,6 +16,8 @@ MarketSphere is a production-grade, secure, multi-vendor e-commerce platform des
 - **Hardened Idempotency Engine:** Checkout and payment operations support `Idempotency-Key` with SHA-256 payload fingerprinting, in-flight lease locking, and 409 conflict detection.
 - **Genuine Business Data:** Zero fabricated ratings or fake reviews. Aggregate star ratings and review counts are computed directly from verified delivered purchases.
 - **Multi-Seller Order State Machine:** Centralized transition validator rejecting illegal state transitions (`PENDING_PAYMENT` -> `DELIVERED`, `CANCELLED` -> `CONFIRMED`, `REFUNDED` -> `PAID`).
+- **HTTPS Transactional Email Engine:** Production OTP delivery via outbound HTTPS REST APIs (Port 443) supporting Resend and Brevo, completely immune to cloud hosting (Render Free Tier) outbound SMTP port 25/465/587 blocks.
+- **Cryptographic OTP Security:** 6-digit numeric OTPs generated with Node.js `crypto`, stored exclusively as SHA-256 hashes, with 10-minute expirations, a 60-second cooldown timer on frontend and backend, and a 5-attempt brute-force lockout.
 - **Containerized & CI/CD Ready:** Complete Docker multi-stage builds, `docker-compose.yml`, and GitHub Actions automated test & build workflows.
 
 ---
@@ -25,7 +27,7 @@ MarketSphere is a production-grade, secure, multi-vendor e-commerce platform des
 - [**`FINAL_CODE_AUDIT.md`**](file:///e:/E%20Commerce/FINAL_CODE_AUDIT.md) — Unsparing code-level audit comparing source code vs documentation claims.
 - [**`FINAL_SECURITY_REPORT.md`**](file:///e:/E%20Commerce/FINAL_SECURITY_REPORT.md) — OWASP Top 10 threat model, authorization matrix, and mass assignment audit.
 - [**`PAYMENT_INTEGRATION.md`**](file:///e:/E%20Commerce/PAYMENT_INTEGRATION.md) — Complete Razorpay payment architecture, signatures, webhooks, and refund flows.
-- [**`TEST_REPORT.md`**](file:///e:/E%20Commerce/TEST_REPORT.md) — Full automated test suite breakdown (8 suites, 35 tests, 100% pass).
+- [**`TEST_REPORT.md`**](file:///e:/E%20Commerce/TEST_REPORT.md) — Full automated test suite breakdown (10 suites, 56 tests, 100% pass).
 - [**`DEPLOYMENT_GUIDE.md`**](file:///e:/E%20Commerce/DEPLOYMENT_GUIDE.md) — Step-by-step production operations, Docker, Vercel, Render, and Atlas setup.
 - [**`FINAL_PRODUCTION_REPORT.md`**](file:///e:/E%20Commerce/FINAL_PRODUCTION_REPORT.md) — Production readiness release gate sign-offs.
 - [**`API_DOCUMENTATION.md`**](file:///e:/E%20Commerce/API_DOCUMENTATION.md) — REST API specification with all 38 endpoints and schemas.
@@ -48,7 +50,7 @@ MarketSphere is a production-grade, secure, multi-vendor e-commerce platform des
 cd backend
 npm ci
 
-# Run Complete Automated Test Suite (8 Suites, 35 Tests)
+# Run Complete Automated Test Suite (10 Suites, 56 Tests)
 npm test
 
 # Bootstrap Administrator Account (CLI Only)

@@ -1,383 +1,342 @@
-const nodemailer = require('nodemailer');
+const axios = require('axios');
 
 /**
- * MarketSphere Email Service Provider
- * Sends real verification emails and notifications using configured SMTP/Gmail,
- * with seamless fallback to Ethereal SMTP for local testing when credentials are not yet added.
+ * MarketSphere Enterprise Email Service
+ * 
+ * Delivers transactional and authentication emails over outbound HTTPS REST APIs
+ * (Port 443), completely eliminating dependency on outbound SMTP connectivity
+ * (Ports 25, 465, 587) which are blocked on cloud hosting platforms like Render Free Tier.
+ * 
+ * Supported Providers:
+ * - 'resend' : HTTPS API (https://api.resend.com/emails) via RESEND_API_KEY
+ * - 'brevo'  : HTTPS API (https://api.brevo.com/v3/smtp/email) via BREVO_API_KEY
+ * - 'console': Safe mock/console dispatch for local offline development & tests
  */
 class EmailService {
   constructor() {
-    this.transporter = null;
-    this.etherealAccount = null;
-    this.isInitializing = false;
-    this.initTransporter();
-  }
-
-  async initTransporter() {
-    if (this.transporter) return this.transporter;
-    if (this.isInitializing) {
-      // Wait for initialization to complete if currently running
-      while (this.isInitializing) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-      return this.transporter;
-    }
-
-    this.isInitializing = true;
-    try {
-      const gmailUser = (process.env.GMAIL_USER || 'pratikfarate33@gmail.com').trim();
-      const gmailPass = (process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_PASS || 'vfpdrqntprshibty').replace(/\s+/g, '');
-
-      const smtpHost = process.env.SMTP_HOST;
-      const smtpUser = process.env.SMTP_USER;
-      const smtpPass = process.env.SMTP_PASS;
-
-      // 1. Direct Gmail Configuration with strict connection timeouts
-      if (gmailUser && gmailPass) {
-        this.transporter = nodemailer.createTransport({
-          service: 'gmail',
-          auth: {
-            user: gmailUser,
-            pass: gmailPass
-          },
-          connectionTimeout: 4000,
-          greetingTimeout: 4000,
-          socketTimeout: 5000
-        });
-        console.log(`[EMAIL SERVICE] Configured Gmail SMTP for ${gmailUser} (with 4s timeout guard)`);
-      }
-      // 2. Custom SMTP Host Configuration (Brevo, SendGrid, Mailgun, Amazon SES, etc.)
-      else if (smtpHost && smtpUser && smtpPass) {
-        const port = Number(process.env.SMTP_PORT || 587);
-        this.transporter = nodemailer.createTransport({
-          host: smtpHost,
-          port,
-          secure: process.env.SMTP_SECURE === 'true' || port === 465,
-          auth: {
-            user: smtpUser,
-            pass: smtpPass
-          },
-          tls: {
-            rejectUnauthorized: false
-          },
-          connectionTimeout: 4000,
-          greetingTimeout: 4000,
-          socketTimeout: 5000
-        });
-        console.log(`[EMAIL SERVICE] Configured SMTP (${smtpHost}:${port}) for ${smtpUser}`);
-      }
-      // 3. Fallback: No real SMTP credentials configured
-      else {
-        this.transporter = null;
-        console.warn('[EMAIL SERVICE] Real SMTP credentials are not configured.');
-      }
-    } catch (err) {
-      console.error('[EMAIL SERVICE] Error during transporter setup:', err.message);
-    } finally {
-      this.isInitializing = false;
-    }
-
-    return this.transporter;
-  }
-
-  isConfiguredWithRealSmtp() {
-    return true;
+    this.timeoutMs = 8000;
   }
 
   /**
-   * Dispatches email over HTTPS REST API (Brevo / Resend) to completely bypass
-   * cloud host SMTP port blocks (e.g., Render Free Tier blocking ports 25, 465, 587).
+   * Resolves the active email provider based on configuration.
    */
-  async sendViaHttpsApi(to, subject, html, text) {
-    const brevoKey = process.env.BREVO_API_KEY;
-    const resendKey = process.env.RESEND_API_KEY;
-
-    if (brevoKey) {
-      try {
-        const https = require('https');
-        const payload = JSON.stringify({
-          sender: { name: 'MarketSphere', email: (process.env.GMAIL_USER || 'pratikfarate33@gmail.com').trim() },
-          to: [{ email: to }],
-          subject,
-          htmlContent: html,
-          textContent: text
-        });
-
-        const res = await new Promise((resolve, reject) => {
-          const req = https.request('https://api.brevo.com/v3/smtp/email', {
-            method: 'POST',
-            headers: {
-              'accept': 'application/json',
-              'api-key': brevoKey.trim(),
-              'content-type': 'application/json',
-              'content-length': Buffer.byteLength(payload)
-            },
-            timeout: 6000
-          }, (response) => {
-            let data = '';
-            response.on('data', chunk => data += chunk);
-            response.on('end', () => resolve({ statusCode: response.statusCode, data }));
-          });
-          req.on('error', reject);
-          req.on('timeout', () => { req.destroy(); reject(new Error('Brevo HTTPS timeout')); });
-          req.write(payload);
-          req.end();
-        });
-
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          console.log(`[EMAIL DISPATCH SUCCESS] Delivered via Brevo HTTPS API to ${to}`);
-          return { delivered: true, provider: 'BREVO_HTTPS' };
-        }
-      } catch (err) {
-        console.warn(`[EMAIL DISPATCH WARNING] Brevo HTTPS dispatch failed: ${err.message}`);
-      }
+  getProvider() {
+    if (process.env.NODE_ENV === 'test') {
+      return process.env.EMAIL_PROVIDER || 'mock';
     }
 
-    if (resendKey) {
-      try {
-        const https = require('https');
-        const payload = JSON.stringify({
-          from: process.env.EMAIL_FROM || 'MarketSphere <onboarding@resend.dev>',
+    const explicit = (process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
+    if (explicit) {
+      return explicit;
+    }
+
+    if (process.env.RESEND_API_KEY) return 'resend';
+    if (process.env.BREVO_API_KEY) return 'brevo';
+
+    return 'console';
+  }
+
+  /**
+   * Helper to safely mask email addresses in operational logs (e.g. j***e@example.com)
+   * Prevents PII leakage in application logs.
+   */
+  maskEmail(email) {
+    if (!email || typeof email !== 'string') return 'unknown';
+    const parts = email.split('@');
+    if (parts.length !== 2) return 'invalid-email';
+    const name = parts[0];
+    const domain = parts[1];
+    const maskedName = name.length <= 2 ? name[0] + '*' : name[0] + '*'.repeat(name.length - 2) + name[name.length - 1];
+    return `${maskedName}@${domain}`;
+  }
+
+  /**
+   * Validates provider configuration on startup or health checks.
+   */
+  verifyConfiguration() {
+    const provider = this.getProvider();
+    const isProduction = process.env.NODE_ENV === 'production';
+
+    if (provider === 'resend') {
+      if (!process.env.RESEND_API_KEY) {
+        const msg = '[EMAIL CONFIG ERROR] EMAIL_PROVIDER is set to "resend" but RESEND_API_KEY is not defined in environment variables.';
+        if (isProduction) console.error(msg); else console.warn(msg);
+        return { isValid: false, provider, error: msg };
+      }
+      return { isValid: true, provider };
+    }
+
+    if (provider === 'brevo') {
+      if (!process.env.BREVO_API_KEY) {
+        const msg = '[EMAIL CONFIG ERROR] EMAIL_PROVIDER is set to "brevo" but BREVO_API_KEY is not defined in environment variables.';
+        if (isProduction) console.error(msg); else console.warn(msg);
+        return { isValid: false, provider, error: msg };
+      }
+      return { isValid: true, provider };
+    }
+
+    if (provider === 'console' || provider === 'mock') {
+      if (isProduction) {
+        console.warn('[EMAIL CONFIG WARNING] Running in PRODUCTION with EMAIL_PROVIDER="console". Real emails will not reach external inboxes. Configure RESEND_API_KEY or BREVO_API_KEY.');
+      }
+      return { isValid: true, provider };
+    }
+
+    return { 
+      isValid: false, 
+      provider, 
+      error: `Unsupported EMAIL_PROVIDER: "${provider}". Expected "resend", "brevo", or "console".` 
+    };
+  }
+
+  /**
+   * Internal dispatcher for Resend HTTPS REST API (api.resend.com)
+   */
+  async _sendViaResend(to, subject, html, text) {
+    const apiKey = (process.env.RESEND_API_KEY || '').trim();
+    if (!apiKey) {
+      return {
+        delivered: false,
+        provider: 'RESEND_HTTPS',
+        error: 'RESEND_API_KEY is missing from environment variables.'
+      };
+    }
+
+    const fromAddress = (process.env.EMAIL_FROM || 'MarketSphere <onboarding@resend.dev>').trim();
+
+    try {
+      const response = await axios.post(
+        'https://api.resend.com/emails',
+        {
+          from: fromAddress,
           to: [to],
           subject,
           html,
           text
-        });
-
-        const res = await new Promise((resolve, reject) => {
-          const req = https.request('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${resendKey.trim()}`,
-              'Content-Type': 'application/json',
-              'Content-Length': Buffer.byteLength(payload)
-            },
-            timeout: 6000
-          }, (response) => {
-            let data = '';
-            response.on('data', chunk => data += chunk);
-            response.on('end', () => resolve({ statusCode: response.statusCode, data }));
-          });
-          req.on('error', reject);
-          req.on('timeout', () => { req.destroy(); reject(new Error('Resend HTTPS timeout')); });
-          req.write(payload);
-          req.end();
-        });
-
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          console.log(`[EMAIL DISPATCH SUCCESS] Delivered via Resend HTTPS API to ${to}`);
-          return { delivered: true, provider: 'RESEND_HTTPS' };
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: this.timeoutMs
         }
-      } catch (err) {
-        console.warn(`[EMAIL DISPATCH WARNING] Resend HTTPS dispatch failed: ${err.message}`);
-      }
-    }
+      );
 
-    const webhookUrl = process.env.GMAIL_WEBHOOK_URL || process.env.EMAIL_WEBHOOK_URL;
-    if (webhookUrl) {
-      if (webhookUrl.includes('YOUR_DEPLOYMENT_ID')) {
-        console.warn('[EMAIL WEBHOOK CONFIG WARNING] GMAIL_WEBHOOK_URL contains "YOUR_DEPLOYMENT_ID" placeholder. Replace with your actual Google Apps Script deployment ID.');
-        return {
-          delivered: false,
-          provider: 'EMAIL_WEBHOOK',
-          error: 'GMAIL_WEBHOOK_URL contains "YOUR_DEPLOYMENT_ID" placeholder. Please replace it with your actual Google deployment ID in Render.'
-        };
-      }
-
-      try {
-        const payload = JSON.stringify({ to, subject, html, text });
-        let resStatus = 0;
-        let resText = '';
-
-        const urlObj = new URL(webhookUrl);
-        urlObj.searchParams.set('to', to);
-        urlObj.searchParams.set('subject', subject);
-
-        if (typeof fetch === 'function') {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 15000);
-          try {
-            const response = await fetch(urlObj.toString(), {
-              method: 'POST',
-              headers: { 
-                'Content-Type': 'application/json',
-                'Accept': 'application/json, text/plain, */*'
-              },
-              body: payload,
-              redirect: 'follow',
-              signal: controller.signal
-            });
-            clearTimeout(timer);
-            resStatus = response.status;
-            resText = await response.text();
-          } catch (fetchErr) {
-            clearTimeout(timer);
-            throw fetchErr;
-          }
-        } else {
-          const https = webhookUrl.startsWith('https') ? require('https') : require('http');
-          const res = await new Promise((resolve, reject) => {
-            const req = https.request(urlObj, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload)
-              },
-              timeout: 15000
-            }, (response) => {
-              let data = '';
-              response.on('data', chunk => data += chunk);
-              response.on('end', () => resolve({ statusCode: response.statusCode, data }));
-            });
-            req.on('error', reject);
-            req.on('timeout', () => { req.destroy(); reject(new Error('Email Webhook timeout')); });
-            req.write(payload);
-            req.end();
-          });
-          resStatus = res.statusCode;
-          resText = res.data;
-        }
-
-        console.log(`[EMAIL WEBHOOK DISPATCH] HTTP ${resStatus} Response: ${resText.slice(0, 150)}`);
-        
-        let parsedData = null;
-        try {
-          parsedData = JSON.parse(resText);
-        } catch (_) {}
-
-        if (parsedData && parsedData.status === 'error') {
-          return {
-            delivered: false,
-            provider: 'EMAIL_WEBHOOK',
-            error: `Google Apps Script error: ${parsedData.error || resText.slice(0, 150)}`
-          };
-        }
-
-        if (resStatus >= 200 && resStatus < 400) {
-          console.log(`[EMAIL DISPATCH SUCCESS] Delivered via Email Webhook to ${to}`);
-          return { delivered: true, provider: 'EMAIL_WEBHOOK', response: resText.slice(0, 100) };
-        } else {
-          return {
-            delivered: false,
-            provider: 'EMAIL_WEBHOOK',
-            error: `Email Webhook returned HTTP ${resStatus}: ${resText.slice(0, 200)}`
-          };
-        }
-      } catch (err) {
-        console.warn(`[EMAIL DISPATCH WARNING] Email Webhook dispatch failed: ${err.message}`);
-        return {
-          delivered: false,
-          provider: 'EMAIL_WEBHOOK',
-          error: `Email Webhook connection error: ${err.message}`
-        };
-      }
-    }
-
-    return null;
-  }
-
-  async sendEmail(to, subject, body, templateType = 'GENERAL', customHtml = null) {
-    try {
-      const gmailUser = (process.env.GMAIL_USER || 'pratikfarate33@gmail.com').trim();
-      const fromAddress = process.env.EMAIL_FROM || `"MarketSphere" <${gmailUser}>`;
-      const htmlContent = customHtml || `
-        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 24px; max-width: 580px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
-          <h2 style="color: #0f172a; margin-top: 0;">${subject}</h2>
-          <p style="color: #334155; font-size: 15px; line-height: 1.6;">${body.replace(/\n/g, '<br/>')}</p>
-          <hr style="margin-top: 30px; border: 0; border-top: 1px solid #e2e8f0;" />
-          <small style="color: #94a3b8; font-size: 12px;">MarketSphere Multi-Vendor Marketplace</small>
-        </div>
-      `;
-
-      // 1. First try HTTPS-based APIs (Brevo / Resend / Google Apps Script Webhook) - completely immune to Render SMTP port blocks
-      const httpsResult = await this.sendViaHttpsApi(to, subject, htmlContent, body);
-      if (httpsResult) {
-        if (httpsResult.delivered) {
-          return httpsResult;
-        }
-        // If an HTTPS relay was explicitly configured (GMAIL_WEBHOOK_URL / RESEND / BREVO), report its explicit failure
-        // instead of falling back to dead SMTP which times out.
-        if (process.env.GMAIL_WEBHOOK_URL || process.env.RESEND_API_KEY || process.env.BREVO_API_KEY) {
-          return httpsResult;
-        }
-      }
-
-      // 2. Try Standard SMTP (Nodemailer) with strict timeout guard
-      const transporter = await this.initTransporter();
-
-      if (transporter) {
-        const mailOptions = {
-          from: fromAddress,
-          to,
-          subject,
-          text: body,
-          html: htmlContent
-        };
-
-        const info = await transporter.sendMail(mailOptions);
-
-        console.log(`\n======================================================`);
-        console.log(`[REAL EMAIL SENT TO INBOX]`);
-        console.log(`  To: ${to}`);
-        console.log(`  Subject: ${subject}`);
-        console.log(`  Message ID: ${info.messageId}`);
-        console.log(`======================================================\n`);
-
+      if (response.status >= 200 && response.status < 300) {
+        console.log(`[EMAIL DISPATCH SUCCESS] Delivered email via Resend HTTPS API to ${this.maskEmail(to)}`);
         return {
           delivered: true,
-          messageId: info.messageId,
-          provider: 'REAL_SMTP'
+          provider: 'RESEND_HTTPS',
+          messageId: response.data?.id || null
         };
       }
+
+      throw new Error(`Resend returned HTTP ${response.status}`);
     } catch (err) {
-      console.error(`[EMAIL DISPATCH ERROR] Failed to send email to ${to}:`, err.message);
-      return { 
-        delivered: false, 
-        error: `Email delivery failed (${err.message}). Render Free Tier blocks outbound SMTP (ports 465/587). Please configure RESEND_API_KEY, BREVO_API_KEY, or GMAIL_WEBHOOK_URL over HTTPS.` 
+      const status = err.response?.status;
+      const resendError = err.response?.data?.message || err.response?.data?.error || err.message;
+
+      // Handle Resend onboarding sandbox domain restriction
+      if (status === 403 && (resendError.includes('only send testing emails') || resendError.includes('verify a domain'))) {
+        console.warn(`[EMAIL DISPATCH RESTRICTION] Resend Free Tier restriction: ${resendError}`);
+        return {
+          delivered: false,
+          provider: 'RESEND_HTTPS',
+          error: "Resend sandbox domain 'onboarding@resend.dev' can only send emails to your verified account email. To send OTPs to any email address, verify a custom domain in Resend or set EMAIL_PROVIDER=brevo with a verified sender."
+        };
+      }
+
+      if (status === 401) {
+        console.error('[EMAIL DISPATCH ERROR] Invalid RESEND_API_KEY. Please verify your API key in Render environment settings.');
+        return {
+          delivered: false,
+          provider: 'RESEND_HTTPS',
+          error: 'Email authentication failed. Please check provider credentials.'
+        };
+      }
+
+      console.error(`[EMAIL DISPATCH ERROR] Resend HTTPS dispatch failed: ${resendError}`);
+      return {
+        delivered: false,
+        provider: 'RESEND_HTTPS',
+        error: `Email service unavailable (${resendError}). Please try again later.`
+      };
+    }
+  }
+
+  /**
+   * Internal dispatcher for Brevo HTTPS REST API (api.brevo.com)
+   * Brevo allows Single Sender Verification (e.g. verified Gmail address) without requiring a custom domain.
+   */
+  async _sendViaBrevo(to, subject, html, text) {
+    const apiKey = (process.env.BREVO_API_KEY || '').trim();
+    if (!apiKey) {
+      return {
+        delivered: false,
+        provider: 'BREVO_HTTPS',
+        error: 'BREVO_API_KEY is missing from environment variables.'
       };
     }
 
-    return { 
-      delivered: false, 
-      error: 'Email delivery unavailable. Please configure email credentials in backend/.env.' 
+    const defaultSenderEmail = process.env.BREVO_SENDER_EMAIL || process.env.GMAIL_USER || 'no-reply@marketsphere.com';
+    const fromAddress = (process.env.EMAIL_FROM || `MarketSphere <${defaultSenderEmail}>`).trim();
+
+    // Extract sender name and email from "Name <email@domain.com>" or fallback
+    let senderName = 'MarketSphere';
+    let senderEmail = defaultSenderEmail;
+    const match = fromAddress.match(/^(?:["']?([^"']*)["']?\s*)?<([^>]+)>/);
+    if (match) {
+      senderName = match[1] ? match[1].trim() : 'MarketSphere';
+      senderEmail = match[2].trim();
+    } else if (fromAddress.includes('@')) {
+      senderEmail = fromAddress;
+    }
+
+    try {
+      const response = await axios.post(
+        'https://api.brevo.com/v3/smtp/email',
+        {
+          sender: { name: senderName, email: senderEmail },
+          to: [{ email: to }],
+          subject,
+          htmlContent: html,
+          textContent: text
+        },
+        {
+          headers: {
+            'api-key': apiKey,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          timeout: this.timeoutMs
+        }
+      );
+
+      if (response.status >= 200 && response.status < 300) {
+        console.log(`[EMAIL DISPATCH SUCCESS] Delivered email via Brevo HTTPS API to ${this.maskEmail(to)}`);
+        return {
+          delivered: true,
+          provider: 'BREVO_HTTPS',
+          messageId: response.data?.messageId || null
+        };
+      }
+
+      throw new Error(`Brevo returned HTTP ${response.status}`);
+    } catch (err) {
+      const status = err.response?.status;
+      const brevoError = err.response?.data?.message || err.message;
+
+      if (status === 401) {
+        console.error('[EMAIL DISPATCH ERROR] Invalid BREVO_API_KEY. Please verify your API key.');
+        return {
+          delivered: false,
+          provider: 'BREVO_HTTPS',
+          error: 'Email authentication failed. Please check provider credentials.'
+        };
+      }
+
+      console.error(`[EMAIL DISPATCH ERROR] Brevo HTTPS dispatch failed: ${brevoError}`);
+      return {
+        delivered: false,
+        provider: 'BREVO_HTTPS',
+        error: `Email service unavailable (${brevoError}). Please try again later.`
+      };
+    }
+  }
+
+  /**
+   * Primary entry point for sending emails.
+   */
+  async sendEmail(to, subject, body, templateType = 'GENERAL', customHtml = null) {
+    if (!to || typeof to !== 'string' || !to.includes('@')) {
+      return { delivered: false, error: 'Valid recipient email address is required.' };
+    }
+
+    const htmlContent = customHtml || `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 24px; max-width: 580px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
+        <h2 style="color: #0f172a; margin-top: 0;">${subject}</h2>
+        <p style="color: #334155; font-size: 15px; line-height: 1.6;">${body.replace(/\n/g, '<br/>')}</p>
+        <hr style="margin-top: 30px; border: 0; border-top: 1px solid #e2e8f0;" />
+        <small style="color: #94a3b8; font-size: 12px;">MarketSphere Multi-Vendor Marketplace</small>
+      </div>
+    `;
+
+    const provider = this.getProvider();
+
+    // 1. Production / Active HTTPS Provider: Resend
+    if (provider === 'resend') {
+      return await this._sendViaResend(to, subject, htmlContent, body);
+    }
+
+    // 2. Production / Active HTTPS Provider: Brevo
+    if (provider === 'brevo') {
+      return await this._sendViaBrevo(to, subject, htmlContent, body);
+    }
+
+    // 3. Local / Test / Mock Provider
+    if (provider === 'mock' || provider === 'console' || process.env.NODE_ENV === 'test') {
+      console.log(`[EMAIL DISPATCH (MOCK/DEV)] ${templateType} to ${this.maskEmail(to)}: "${subject}"`);
+      return {
+        delivered: true,
+        provider: 'MOCK_DEV',
+        messageId: `mock_${Date.now()}`
+      };
+    }
+
+    // 4. Fallback if misconfigured
+    return {
+      delivered: false,
+      error: `Email service is not configured. Set EMAIL_PROVIDER=resend with RESEND_API_KEY, or EMAIL_PROVIDER=brevo with BREVO_API_KEY in Render environment settings.`
     };
   }
 
+  /**
+   * Dispatches a 6-digit OTP verification email with a branded, secure template.
+   */
   async sendOtpEmail(to, otp) {
     const subject = `Your MarketSphere Verification Code is ${otp}`;
-    const body = `Welcome to MarketSphere! Your one-time verification code (OTP) is: ${otp}. It is valid for 10 minutes. Please enter this code on the registration page to verify your email address.`;
+    const body = `Welcome to MarketSphere! Your one-time verification code (OTP) is: ${otp}. It is valid for 10 minutes. Please enter this code on the registration page to verify your email address. Do not share this code with anyone.`;
+    
     const html = `
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 32px; border: 1px solid #e2e8f0; border-radius: 16px; background-color: #ffffff; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
         <div style="text-align: center; margin-bottom: 24px;">
           <h1 style="color: #d97706; margin: 0; font-size: 28px; font-weight: 800; letter-spacing: -0.5px;">MarketSphere</h1>
-          <p style="color: #64748b; font-size: 13px; margin: 6px 0 0 0;">Empowering Independent & Authentic Commerce</p>
+          <p style="color: #64748b; font-size: 13px; margin: 6px 0 0 0;">Authentic & Independent Multi-Vendor Commerce</p>
         </div>
         <div style="background: linear-gradient(135deg, #fef3c7 0%, #fffbeb 100%); border: 1px solid #fde68a; border-radius: 14px; padding: 28px 20px; text-align: center; margin-bottom: 24px;">
           <p style="color: #78350f; font-size: 15px; font-weight: 700; margin: 0 0 16px 0;">Verify Your Email Address</p>
           <div style="font-size: 38px; font-weight: 900; letter-spacing: 10px; color: #0f172a; font-family: 'Courier New', Courier, monospace; padding: 14px 24px; background-color: #ffffff; border: 2px dashed #f59e0b; border-radius: 10px; display: inline-block; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
             ${otp}
           </div>
-          <p style="color: #92400e; font-size: 12px; margin: 16px 0 0 0; font-weight: 500;">
-            ⏳ Valid for 10 minutes. Keep this code confidential.
+          <p style="color: #92400e; font-size: 12px; margin: 16px 0 0 0; font-weight: 600;">
+            ⏳ Valid for 10 minutes • Single-use only
           </p>
         </div>
         <p style="color: #475569; font-size: 14px; line-height: 1.6; margin: 0 0 16px 0;">
-          Hi there, welcome to MarketSphere! Use the one-time password (OTP) above to verify your email and activate your account.
+          Hi there, welcome to MarketSphere! Use the one-time verification code above to verify your email address and activate your account.
         </p>
+        <div style="background-color: #f8fafc; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 4px; margin-bottom: 20px;">
+          <p style="color: #475569; font-size: 12px; line-height: 1.5; margin: 0;">
+            🔒 <strong>Security Notice:</strong> Never share this code with anyone. MarketSphere representatives will never ask for your verification code.
+          </p>
+        </div>
         <p style="color: #94a3b8; font-size: 12px; line-height: 1.5; margin: 0;">
-          If you didn't create an account with MarketSphere, please disregard this email. Your email address will remain unlinked.
+          If you did not initiate this request, you can safely disregard this email. Your email address will remain unlinked.
         </p>
         <hr style="margin-top: 28px; border: 0; border-top: 1px solid #f1f5f9;" />
         <p style="text-align: center; color: #94a3b8; font-size: 11px; margin: 16px 0 0 0;">
-          © ${new Date().getFullYear()} MarketSphere Marketplace. All rights reserved.
+          © ${new Date().getFullYear()} MarketSphere Multi-Vendor Platform. All rights reserved.
         </p>
       </div>
     `;
-    return this.sendEmail(to, subject, body, 'EMAIL_OTP_VERIFICATION', html, otp);
+
+    return this.sendEmail(to, subject, body, 'EMAIL_OTP_VERIFICATION', html);
   }
 
   async sendOrderConfirmation(to, order) {
-    const subject = `Order Confirmation #${order._id.toString().slice(-6).toUpperCase()}`;
+    const orderId = (order._id || order.id || '').toString().slice(-6).toUpperCase();
+    const subject = `Order Confirmation #${orderId}`;
     const body = `Thank you for your order! Total amount: ₹${order.totalAmount}. Order status: ${order.orderStatus}.`;
     return this.sendEmail(to, subject, body, 'ORDER_CONFIRMATION');
   }

@@ -69,8 +69,24 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Tiered Rate Limiting
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 30, // 30 attempts per 15 min
+  max: process.env.NODE_ENV === 'test' ? 1000 : 30, // 30 attempts per 15 min
   message: { status: 'error', error: { code: 'RATE_LIMIT_EXCEEDED', message: 'Too many authentication attempts. Please try again after 15 minutes.' } },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const otpResendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: process.env.NODE_ENV === 'test' ? 1000 : 10, // 10 resend requests per 15 min
+  message: { status: 'error', error: { code: 'RATE_LIMIT_EXCEEDED', message: 'Too many OTP resend attempts. Please try again later.' } },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: process.env.NODE_ENV === 'test' ? 1000 : 25, // 25 verify attempts per 15 min
+  message: { status: 'error', error: { code: 'RATE_LIMIT_EXCEEDED', message: 'Too many verification attempts. Please wait.' } },
   standardHeaders: true,
   legacyHeaders: false
 });
@@ -93,6 +109,8 @@ const generalLimiter = rateLimit({
 
 app.use('/api/v1/auth/login', authLimiter);
 app.use('/api/v1/auth/register', authLimiter);
+app.use('/api/v1/auth/resend-otp', otpResendLimiter);
+app.use('/api/v1/auth/verify-otp', otpVerifyLimiter);
 app.use('/api/v1/orders/checkout', checkoutLimiter);
 app.use('/api/', generalLimiter);
 

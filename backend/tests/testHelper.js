@@ -4,21 +4,23 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
 let mongoServer;
 
 const connectTestDb = async () => {
-  if (process.env.MONGO_URI) {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(process.env.MONGO_URI);
-    }
-    return;
-  }
-  if (!mongoServer) {
-    mongoServer = await MongoMemoryServer.create();
-  }
+  const uri = process.env.MONGO_URI || process.env.MONGO_URI_TEST || 'mongodb://127.0.0.1:27017/marketsphere_test';
   if (mongoose.connection.readyState === 0) {
-    await mongoose.connect(mongoServer.getUri());
+    try {
+      await mongoose.connect(uri, { serverSelectionTimeoutMS: 3000 });
+    } catch (err) {
+      // If local MongoDB is not reachable, fall back to MongoMemoryServer
+      if (!mongoServer) {
+        mongoServer = await MongoMemoryServer.create();
+      }
+      await mongoose.connect(mongoServer.getUri());
+    }
   }
+  await clearDatabase();
 };
 
 const disconnectTestDb = async () => {
+  await clearDatabase();
   if (mongoose.connection.readyState !== 0) {
     await mongoose.disconnect();
   }

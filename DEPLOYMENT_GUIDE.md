@@ -24,10 +24,11 @@
 | `CLOUDINARY_CLOUD_NAME` | Cloudinary persistent object storage | Optional (Fallback to local) | `marketsphere-prod` |
 | `CLOUDINARY_API_KEY` | Cloudinary API Key | Optional | `123456789012345` |
 | `CLOUDINARY_API_SECRET` | Cloudinary API Secret | Optional | `secret_key` |
-| `SMTP_HOST` | Email provider SMTP host | Optional (Console log dev fallback) | `smtp.resend.com` |
-| `SMTP_PORT` | Email provider SMTP port | Optional | `587` |
-| `SMTP_USER` | SMTP Username | Optional | `resend` |
-| `SMTP_PASS` | SMTP Password | Optional | `re_xxxxxxxxxxxx` |
+| `EMAIL_PROVIDER` | Transactional email provider (`resend`, `brevo`, `console`) | Yes (in Prod) | `resend` (or `brevo`) |
+| `EMAIL_FROM` | Sender display name & email address | Yes (in Prod) | `MarketSphere <onboarding@resend.dev>` |
+| `RESEND_API_KEY` | Resend API key (if `EMAIL_PROVIDER=resend`) | Conditional | `re_xxxxxxxxxxxxxxxxxxxx` |
+| `BREVO_API_KEY` | Brevo API key (if `EMAIL_PROVIDER=brevo`) | Conditional | `xkeysib-xxxxxxxxxxxxxxxx` |
+| `BREVO_SENDER_EMAIL` | Verified sender email in Brevo (no domain required) | Conditional | `your_verified@gmail.com` |
 
 ### Frontend (`frontend/.env`)
 | Variable | Description | Required in Production | Example / Default |
@@ -93,6 +94,46 @@ ADMIN_EMAIL="admin@yourdomain.com" ADMIN_PASSWORD="YourStrongPassword2026!" npm 
    - `refund.processed`
    - `refund.failed`
 6. Click **Create Webhook**.
+
+### Step 3.6: Configure Production Transactional Email (HTTPS API)
+
+> [!IMPORTANT]
+> **Why Render Blocks Nodemailer/Gmail SMTP:**
+> Cloud platforms (Render Free Tier, AWS EC2, GCP, Railway) intentionally block outbound TCP traffic on ports **25, 465, and 587** to prevent spam.
+> Standard Nodemailer/Gmail SMTP attempts will hang until socket timeout (`ETIMEDOUT`). MarketSphere solves this permanently by delivering emails over **outbound HTTPS (Port 443)** using either Resend or Brevo.
+
+Choose **Option A** (Resend) or **Option B** (Brevo):
+
+#### Option A: Resend (https://resend.com) - Preferred with Custom Domain
+1. Sign up for a free account at [Resend.com](https://resend.com) (Free tier: 3,000 emails/mo, 100/day).
+2. Go to **API Keys** -> Create an API key -> Copy key starting with `re_`.
+3. In **Render Dashboard** -> Your Web Service -> **Environment**:
+   - `EMAIL_PROVIDER`: `resend`
+   - `RESEND_API_KEY`: `re_your_api_key_here`
+   - `EMAIL_FROM`: `MarketSphere <onboarding@resend.dev>` (for testing with your account owner email) or `MarketSphere <auth@yourdomain.com>` (for production).
+4. **Recipient Limitation Notice:**
+   - The default `onboarding@resend.dev` sender identity **only delivers to your Resend account owner email address**.
+   - To send registration OTPs to *any* customer's Gmail inbox, you must verify your custom domain in Resend (**Domains** -> **Add Domain** -> Add the provided DNS TXT/MX records to Cloudflare, GoDaddy, or your DNS host).
+
+#### Option B: Brevo (https://brevo.com) - Free Delivery to ANY Gmail WITHOUT Custom Domain
+1. Sign up for a free account at [Brevo.com](https://brevo.com) (Free tier: 300 emails/day, 9,000/mo).
+2. Go to **Senders, Domains & Dedicated IPs** -> **Senders** -> **Add a Sender**:
+   - Add your existing personal Gmail address (e.g. `yourname@gmail.com`).
+   - Brevo will send a confirmation link to that address. Click the link to verify.
+3. Go to **SMTP & API** -> **API Keys** -> **Generate a new API key**.
+4. In **Render Dashboard** -> Your Web Service -> **Environment**:
+   - `EMAIL_PROVIDER`: `brevo`
+   - `BREVO_API_KEY`: `xkeysib-your_brevo_api_key_here`
+   - `EMAIL_FROM`: `MarketSphere <yourname@gmail.com>`
+   - `BREVO_SENDER_EMAIL`: `yourname@gmail.com`
+5. *Result:* Your application can now send real registration OTP emails to any Gmail address worldwide over HTTPS, without paying for a domain or Render upgrade.
+
+#### Step 3.7: Live Verification of Email Relay
+Once deployed on Render, verify your live email relay in 5 seconds by visiting:
+```
+GET https://<your-render-app>.onrender.com/api/v1/auth/test-email-status?to=your_real_inbox@gmail.com
+```
+This returns the active provider configuration status and dispatches a test confirmation email to your real inbox.
 
 ---
 

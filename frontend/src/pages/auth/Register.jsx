@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import apiClient from '../../api/client';
 import { useNotification } from '../../context/NotificationContext';
@@ -30,9 +30,22 @@ export default function Register() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [resending, setResending] = useState(false);
+  const [countdown, setCountdown] = useState(0);
 
   const navigate = useNavigate();
   const { toast, modal } = useNotification();
+
+  useEffect(() => {
+    let timer;
+    if (step === 'otp' && countdown > 0) {
+      timer = setInterval(() => {
+        setCountdown((prev) => (prev > 0 ? prev - 1 : 0));
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [step, countdown]);
 
   const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
 
@@ -90,6 +103,7 @@ export default function Register() {
       if (res.status === 'success') {
         const targetEmail = res.email || formData.email.trim().toLowerCase();
         setVerificationEmail(targetEmail);
+        setCountdown(res.cooldownSeconds || 60);
         setStep('otp');
 
         modal.success({
@@ -100,6 +114,11 @@ export default function Register() {
       }
     } catch (err) {
       const msg = err.response?.data?.message || err.response?.data?.error?.message || err.message || 'Registration failed';
+      if (err.response?.data?.requiresOtp) {
+        setVerificationEmail(formData.email.trim().toLowerCase());
+        setCountdown(err.response?.data?.retryAfter || 60);
+        setStep('otp');
+      }
       setError(msg);
       toast.error(msg, 'Registration Error');
     } finally {
@@ -149,17 +168,22 @@ export default function Register() {
   };
 
   const handleResendOtp = async () => {
+    if (countdown > 0 || resending) return;
     setResending(true);
     setError('');
     try {
       const res = await apiClient.post('/auth/resend-otp', { email: verificationEmail });
       if (res.status === 'success') {
+        setCountdown(res.cooldownSeconds || 60);
         toast.success(
           `A new verification code was sent to ${verificationEmail}. Please check your inbox.`,
           'Code Dispatched'
         );
       }
     } catch (err) {
+      if (err.response?.status === 429 && err.response?.data?.retryAfter) {
+        setCountdown(err.response.data.retryAfter);
+      }
       const msg = err.response?.data?.message || err.message || 'Failed to resend code';
       setError(msg);
       toast.error(msg, 'Dispatch Failed');
@@ -245,11 +269,17 @@ export default function Register() {
             <button
               type="button"
               onClick={handleResendOtp}
-              disabled={resending}
-              className="text-amber-600 hover:text-amber-700 font-semibold hover:underline disabled:opacity-50 inline-flex items-center gap-1.5"
+              disabled={resending || countdown > 0}
+              className="text-amber-600 hover:text-amber-700 font-semibold hover:underline disabled:opacity-50 disabled:no-underline inline-flex items-center gap-1.5"
             >
               {resending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-              <span>{resending ? 'Sending...' : 'Resend Code'}</span>
+              <span>
+                {resending 
+                  ? 'Sending...' 
+                  : countdown > 0 
+                    ? `Resend Code (${countdown}s)` 
+                    : 'Resend Code'}
+              </span>
             </button>
             <button
               type="button"

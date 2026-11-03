@@ -3,10 +3,12 @@ const mongoose = require('mongoose');
 const app = require('./app');
 const connectDB = require('./config/db');
 const { getJwtSecret } = require('./middlewares/auth');
+const emailService = require('./services/emailService');
 
 // Fail-fast verification of required secrets
 try {
   getJwtSecret();
+  emailService.verifyConfiguration();
 } catch (err) {
   console.error('[STARTUP ERROR]', err.message);
   process.exit(1);

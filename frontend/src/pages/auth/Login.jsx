@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import apiClient from '../../api/client';
 import { useNotification } from '../../context/NotificationContext';
@@ -19,10 +19,23 @@ export default function Login() {
   const [showOtp, setShowOtp] = useState(false);
   const [otp, setOtp] = useState('');
   const [resending, setResending] = useState(false);
+  const [countdown, setCountdown] = useState(0);
   const [infoMsg, setInfoMsg] = useState('');
 
   const navigate = useNavigate();
   const { toast, modal } = useNotification();
+
+  useEffect(() => {
+    let timer;
+    if (showOtp && countdown > 0) {
+      timer = setInterval(() => {
+        setCountdown((prev) => (prev > 0 ? prev - 1 : 0));
+      }, 1000);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [showOtp, countdown]);
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -53,6 +66,7 @@ export default function Login() {
     } catch (err) {
       if (err.response?.data?.requiresOtp) {
         setShowOtp(true);
+        setCountdown(60);
         const msg = err.response.data.message || 'Please verify your email address to continue.';
         setInfoMsg(msg);
         modal.warning({
@@ -120,17 +134,22 @@ export default function Login() {
   };
 
   const handleResendOtp = async () => {
+    if (countdown > 0 || resending) return;
     setResending(true);
     setError('');
     try {
       const res = await apiClient.post('/auth/resend-otp', { email: email.trim().toLowerCase() });
       if (res.status === 'success') {
+        setCountdown(res.cooldownSeconds || 60);
         toast.success(
           `A new verification code was sent to ${email.trim().toLowerCase()}. Please check your inbox.`,
           'Code Dispatched'
         );
       }
     } catch (err) {
+      if (err.response?.status === 429 && err.response?.data?.retryAfter) {
+        setCountdown(err.response.data.retryAfter);
+      }
       const msg = err.response?.data?.message || err.message || 'Failed to resend code';
       setError(msg);
       toast.error(msg, 'Dispatch Failed');
@@ -219,11 +238,17 @@ export default function Login() {
             <button
               type="button"
               onClick={handleResendOtp}
-              disabled={resending}
-              className="text-amber-600 hover:text-amber-700 font-semibold hover:underline disabled:opacity-50 inline-flex items-center gap-1.5"
+              disabled={resending || countdown > 0}
+              className="text-amber-600 hover:text-amber-700 font-semibold hover:underline disabled:opacity-50 disabled:no-underline inline-flex items-center gap-1.5"
             >
               {resending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-              <span>{resending ? 'Sending...' : 'Resend Code'}</span>
+              <span>
+                {resending 
+                  ? 'Sending...' 
+                  : countdown > 0 
+                    ? `Resend Code (${countdown}s)` 
+                    : 'Resend Code'}
+              </span>
             </button>
             <button
               type="button"

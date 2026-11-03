@@ -15,6 +15,35 @@ const generateToken = (id, role) => {
   });
 };
 
+/**
+ * Computes SHA-256 hash of a numeric OTP for secure non-plaintext database storage.
+ */
+const hashOtp = (otp) => {
+  return crypto.createHash('sha256').update(String(otp).trim()).digest('hex');
+};
+
+/**
+ * Secure, constant-time comparison for OTP verification.
+ * Supports both hashed and legacy plaintext values.
+ */
+const compareOtp = (submittedOtp, storedHashOrOtp) => {
+  if (!submittedOtp || !storedHashOrOtp) return false;
+  const submittedHash = hashOtp(submittedOtp);
+  if (storedHashOrOtp.length === 64) {
+    try {
+      return crypto.timingSafeEqual(Buffer.from(submittedHash, 'utf8'), Buffer.from(storedHashOrOtp, 'utf8'));
+    } catch (_) {
+      return false;
+    }
+  }
+  const legacyHash = hashOtp(storedHashOrOtp);
+  try {
+    return crypto.timingSafeEqual(Buffer.from(submittedHash, 'utf8'), Buffer.from(legacyHash, 'utf8'));
+  } catch (_) {
+    return false;
+  }
+};
+
 exports.register = async (req, res, next) => {
   try {
     const { firstName, lastName, email, phone, password } = req.body;
@@ -48,8 +77,8 @@ exports.register = async (req, res, next) => {
     // 3. Verify uniqueness of Email in confirmed Users
     const emailExists = await User.findOne({ email: normalizedEmail });
     if (emailExists) {
-      if (!emailExists.isEmailVerified || normalizedEmail === 'pratikfarate33@gmail.com' || req.body.forceReset) {
-        // Purge test record so fresh OTP registration proceeds cleanly
+      if (!emailExists.isEmailVerified) {
+        // Purge unverified legacy record so fresh registration proceeds cleanly
         await User.deleteOne({ _id: emailExists._id });
       } else {
         return res.status(400).json({ 
@@ -62,7 +91,7 @@ exports.register = async (req, res, next) => {
     // 4. Verify uniqueness of Mobile Number in confirmed Users
     const phoneExists = await User.findOne({ phone: normalizedPhone });
     if (phoneExists) {
-      if (!phoneExists.isEmailVerified || normalizedEmail === 'pratikfarate33@gmail.com' || req.body.forceReset) {
+      if (!phoneExists.isEmailVerified) {
         await User.deleteOne({ _id: phoneExists._id });
       } else {
         return res.status(400).json({ 
@@ -72,37 +101,57 @@ exports.register = async (req, res, next) => {
       }
     }
 
+    // 5. Cooldown Guard on existing pending registration (60-second limit)
+    const existingPending = await PendingUser.findOne({ email: normalizedEmail });
+    if (existingPending) {
+      const elapsed = Date.now() - new Date(existingPending.lastResendAt || existingPending.createdAt).getTime();
+      if (elapsed < 60000) {
+        const waitSeconds = Math.ceil((60000 - elapsed) / 1000);
+        return res.status(429).json({
+          status: 'error',
+          code: 'RESEND_COOLDOWN',
+          message: `Please wait ${waitSeconds} seconds before requesting a new verification code.`,
+          retryAfter: waitSeconds,
+          requiresOtp: true,
+          email: normalizedEmail
+        });
+      }
+    }
+
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // Generate cryptographically secure 6-digit numeric OTP
+    // Generate cryptographically secure 6-digit numeric OTP and compute its SHA-256 hash
     const otp = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = hashOtp(otp);
     const emailOtpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    // CRITICAL FIX: Clear any existing unverified pending registration for this email or phone
+    // Clear any existing unverified pending registration for this email or phone
     await PendingUser.deleteMany({
       $or: [{ email: normalizedEmail }, { phone: normalizedPhone }]
     });
 
-    // Save strictly to PendingUser collection ONLY.
-    // The permanent User record is NEVER created until the user enters the valid OTP!
+    // Save strictly to PendingUser collection with hashed OTP
     await PendingUser.create({
       firstName: firstName.trim(),
       lastName: lastName.trim(),
       email: normalizedEmail,
       phone: normalizedPhone,
       passwordHash,
-      otp,
-      otpExpires: emailOtpExpires
+      otpHash,
+      otpExpires: emailOtpExpires,
+      attempts: 0,
+      maxAttempts: 5,
+      lastResendAt: new Date()
     });
 
-    // Dispatch OTP email
+    // Dispatch OTP email via HTTPS API
     const emailDispatch = await emailService.sendOtpEmail(normalizedEmail, otp);
     if (!emailDispatch.delivered) {
       await PendingUser.deleteMany({ email: normalizedEmail });
       return res.status(503).json({
         status: 'error',
-        message: emailDispatch.error || 'Unable to deliver verification email to your email address. Please ensure email service is configured in backend/.env.'
+        message: emailDispatch.error || 'Unable to deliver verification email to your email address. Please try again later.'
       });
     }
 
@@ -110,7 +159,8 @@ exports.register = async (req, res, next) => {
       status: 'success',
       message: `A 6-digit verification code has been dispatched to your email address (${normalizedEmail}). Please check your inbox.`,
       requiresOtp: true,
-      email: normalizedEmail
+      email: normalizedEmail,
+      cooldownSeconds: 60
     });
   } catch (error) {
     next(error);
@@ -125,6 +175,11 @@ exports.verifyEmailOtp = async (req, res, next) => {
     }
 
     const normalizedEmail = email.trim().toLowerCase();
+    const cleanOtp = String(otp).trim();
+
+    if (!/^\d{6}$/.test(cleanOtp)) {
+      return res.status(400).json({ status: 'error', message: 'Verification OTP must be a 6-digit numeric code' });
+    }
 
     // 1. First look up the pending registration
     const pending = await PendingUser.findOne({ email: normalizedEmail });
@@ -148,14 +203,22 @@ exports.verifyEmailOtp = async (req, res, next) => {
       }
 
       // Check if there is an older legacy user pending verification
-      if (existingUser && !existingUser.isEmailVerified && existingUser.emailOtp) {
+      if (existingUser && !existingUser.isEmailVerified && (existingUser.emailOtpHash || existingUser.emailOtp)) {
         if (new Date() > new Date(existingUser.emailOtpExpires)) {
           return res.status(400).json({ status: 'error', message: 'Verification code has expired. Please request a new OTP.' });
         }
-        if (String(existingUser.emailOtp).trim() === String(otp).trim()) {
+
+        if ((existingUser.emailOtpAttempts || 0) >= 5) {
+          return res.status(400).json({ status: 'error', message: 'Too many invalid attempts. This verification code has been invalidated. Please request a new OTP.' });
+        }
+
+        const isMatch = compareOtp(cleanOtp, existingUser.emailOtpHash || existingUser.emailOtp);
+        if (isMatch) {
           existingUser.isEmailVerified = true;
+          existingUser.emailOtpHash = null;
           existingUser.emailOtp = null;
           existingUser.emailOtpExpires = null;
+          existingUser.emailOtpAttempts = 0;
           await existingUser.save();
 
           return res.json({
@@ -170,6 +233,11 @@ exports.verifyEmailOtp = async (req, res, next) => {
               token: generateToken(existingUser._id, existingUser.role)
             }
           });
+        } else {
+          existingUser.emailOtpAttempts = (existingUser.emailOtpAttempts || 0) + 1;
+          await existingUser.save();
+          const remaining = Math.max(0, 5 - existingUser.emailOtpAttempts);
+          return res.status(400).json({ status: 'error', message: `Invalid verification code. ${remaining} attempt(s) remaining.` });
         }
       }
 
@@ -179,29 +247,46 @@ exports.verifyEmailOtp = async (req, res, next) => {
       });
     }
 
+    // Check expiration
     if (new Date() > new Date(pending.otpExpires)) {
       return res.status(400).json({ status: 'error', message: 'Verification code has expired. Please request a new OTP.' });
     }
 
-    if (String(pending.otp).trim() !== String(otp).trim()) {
+    // Check attempt limits (max 5)
+    const maxAttempts = pending.maxAttempts || 5;
+    if ((pending.attempts || 0) >= maxAttempts) {
+      await PendingUser.deleteOne({ _id: pending._id });
+      return res.status(400).json({
+        status: 'error',
+        message: 'Too many invalid attempts. This verification code has been invalidated. Please register again or request a new OTP.'
+      });
+    }
+
+    // Constant-time compare submitted OTP against hashed or legacy OTP
+    const isOtpValid = compareOtp(cleanOtp, pending.otpHash || pending.otp);
+    if (!isOtpValid) {
       pending.attempts = (pending.attempts || 0) + 1;
       await pending.save();
-      return res.status(400).json({ status: 'error', message: 'Invalid verification code. Please check your email and try again.' });
+      const remaining = Math.max(0, maxAttempts - pending.attempts);
+      return res.status(400).json({
+        status: 'error',
+        message: `Invalid verification code. ${remaining} attempt(s) remaining.`
+      });
     }
 
     // Double check email & phone uniqueness in confirmed User collection
     const emailTaken = await User.findOne({ email: pending.email });
-    if (emailTaken) {
+    if (emailTaken && emailTaken.isEmailVerified) {
       await PendingUser.deleteMany({ email: pending.email });
       return res.status(400).json({ status: 'error', message: 'An account is already verified with this email address.' });
     }
 
     const phoneTaken = await User.findOne({ phone: pending.phone });
-    if (phoneTaken) {
+    if (phoneTaken && phoneTaken.isEmailVerified) {
       return res.status(400).json({ status: 'error', message: 'This mobile number is already linked to an existing account.' });
     }
 
-    // NOW, AND ONLY NOW, create the permanent verified user record in the User collection!
+    // NOW create permanent verified user record in User collection
     const user = await User.create({
       firstName: pending.firstName,
       lastName: pending.lastName,
@@ -213,7 +298,7 @@ exports.verifyEmailOtp = async (req, res, next) => {
       isEmailVerified: true
     });
 
-    // Remove the pending registration record
+    // Invalidate & remove pending registration record immediately
     await PendingUser.deleteMany({ email: pending.email });
 
     res.json({
@@ -251,9 +336,25 @@ exports.resendEmailOtp = async (req, res, next) => {
       return res.status(404).json({ status: 'error', message: 'No pending registration found for this email. Please register again.' });
     }
 
+    // Enforce 60-second cooldown between resends
+    const lastResend = pending.lastResendAt || pending.createdAt;
+    const elapsed = Date.now() - new Date(lastResend).getTime();
+    if (elapsed < 60000) {
+      const waitSeconds = Math.ceil((60000 - elapsed) / 1000);
+      return res.status(429).json({
+        status: 'error',
+        code: 'RESEND_COOLDOWN',
+        message: `Please wait ${waitSeconds} seconds before requesting a new verification code.`,
+        retryAfter: waitSeconds
+      });
+    }
+
     const otp = crypto.randomInt(100000, 1000000).toString();
-    pending.otp = otp;
+    pending.otpHash = hashOtp(otp);
+    pending.otp = undefined; // Clear any legacy plaintext
     pending.otpExpires = new Date(Date.now() + 10 * 60 * 1000);
+    pending.attempts = 0;
+    pending.lastResendAt = new Date();
     await pending.save();
 
     const emailDispatch = await emailService.sendOtpEmail(pending.email, otp);
@@ -267,7 +368,8 @@ exports.resendEmailOtp = async (req, res, next) => {
     res.json({
       status: 'success',
       message: 'A new 6-digit verification code has been dispatched to your email address.',
-      email: pending.email
+      email: pending.email,
+      cooldownSeconds: 60
     });
   } catch (error) {
     next(error);
@@ -299,11 +401,19 @@ exports.login = async (req, res, next) => {
     }
 
     if (user.isEmailVerified === false && process.env.NODE_ENV !== 'test' && user.role !== 'ADMIN') {
-      const otp = crypto.randomInt(100000, 1000000).toString();
-      user.emailOtp = otp;
-      user.emailOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
-      await user.save();
-      await emailService.sendOtpEmail(user.email, otp);
+      const lastResend = user.emailOtpLastResendAt;
+      const shouldDispatchNewOtp = !lastResend || (Date.now() - new Date(lastResend).getTime() >= 60000);
+
+      if (shouldDispatchNewOtp) {
+        const otp = crypto.randomInt(100000, 1000000).toString();
+        user.emailOtpHash = hashOtp(otp);
+        user.emailOtp = null;
+        user.emailOtpExpires = new Date(Date.now() + 10 * 60 * 1000);
+        user.emailOtpAttempts = 0;
+        user.emailOtpLastResendAt = new Date();
+        await user.save();
+        await emailService.sendOtpEmail(user.email, otp);
+      }
 
       return res.status(403).json({
         status: 'error',
@@ -471,54 +581,29 @@ exports.deleteAddress = async (req, res, next) => {
 
 exports.testEmailStatus = async (req, res, next) => {
   try {
-    const to = (req.query.to || process.env.GMAIL_USER || 'pratikfarate33@gmail.com').trim();
-    const webhookUrl = process.env.GMAIL_WEBHOOK_URL || process.env.EMAIL_WEBHOOK_URL;
-
-    let webhookProbe = null;
-    if (webhookUrl) {
-      try {
-        const maskedUrl = webhookUrl.replace(/(\/s\/)[^/]{10,}(\/exec)/, '$1[MASKED_DEPLOYMENT_ID]$2');
-        let getStatus = null;
-        let getBody = null;
-        if (typeof fetch === 'function') {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 10000);
-          try {
-            const probeRes = await fetch(webhookUrl, { method: 'GET', redirect: 'follow', signal: controller.signal });
-            clearTimeout(timer);
-            getStatus = probeRes.status;
-            getBody = (await probeRes.text()).slice(0, 300);
-          } catch (e) {
-            clearTimeout(timer);
-            getBody = e.message;
-          }
-        }
-        webhookProbe = {
-          configuredUrl: maskedUrl,
-          getHttpStatus: getStatus,
-          getResponseBodyPreview: getBody
-        };
-      } catch (probeErr) {
-        webhookProbe = { error: probeErr.message };
-      }
+    const to = (req.query.to || '').trim();
+    if (!to) {
+      return res.status(400).json({ 
+        status: 'error', 
+        message: 'Query parameter "to" is required (e.g. /api/v1/auth/test-email-status?to=yourname@gmail.com)' 
+      });
     }
 
+    const providerStatus = emailService.verifyConfiguration();
     const config = {
-      gmailUser: process.env.GMAIL_USER || 'pratikfarate33@gmail.com',
-      hasAppPassword: Boolean(process.env.GMAIL_APP_PASSWORD),
-      hasGmailWebhook: Boolean(webhookUrl),
-      webhookContainsPlaceholder: Boolean(webhookUrl && webhookUrl.includes('YOUR_DEPLOYMENT_ID')),
-      hasResend: Boolean(process.env.RESEND_API_KEY),
-      hasBrevo: Boolean(process.env.BREVO_API_KEY),
-      webhookProbe
+      activeProvider: emailService.getProvider(),
+      isValid: providerStatus.isValid,
+      hasResendKey: Boolean(process.env.RESEND_API_KEY),
+      hasBrevoKey: Boolean(process.env.BREVO_API_KEY),
+      configuredFrom: process.env.EMAIL_FROM || 'MarketSphere <onboarding@resend.dev>'
     };
 
     const result = await emailService.sendEmail(
       to,
       'MarketSphere Email Integration Test',
-      'This is a test verification message to confirm that your email relay is active.',
+      'This is an automated test verification message to confirm that your MarketSphere HTTPS email integration is active.',
       'GENERAL',
-      '<div style="font-family:sans-serif;padding:20px;border:1px solid #e2e8f0;border-radius:8px;"><h2>MarketSphere Live Email Relay is ACTIVE</h2><p>Your email integration is working properly.</p></div>'
+      '<div style="font-family:sans-serif;padding:24px;border:1px solid #e2e8f0;border-radius:12px;max-width:500px;margin:0 auto;"><h2 style="color:#d97706;margin-top:0;">MarketSphere HTTPS Email Integration Test</h2><p style="color:#334155;font-size:14px;line-height:1.6;">Your transactional email delivery over HTTPS is configured and operational.</p><hr style="border:0;border-top:1px solid #e2e8f0;margin:20px 0;"/><small style="color:#94a3b8;">Sent via MarketSphere API</small></div>'
     );
 
     res.json({

@@ -21,8 +21,11 @@ const userSchema = new mongoose.Schema({
   addresses: [addressSchema],
   isActive: { type: Boolean, default: true },
   isEmailVerified: { type: Boolean, default: false },
-  emailOtp: { type: String, default: null },
-  emailOtpExpires: { type: Date, default: null }
+  emailOtpHash: { type: String, default: null },
+  emailOtp: { type: String, default: null }, // Legacy compatibility fallback
+  emailOtpExpires: { type: Date, default: null },
+  emailOtpAttempts: { type: Number, default: 0 },
+  emailOtpLastResendAt: { type: Date, default: null }
 }, { timestamps: true });
 
 userSchema.index({ role: 1 });
