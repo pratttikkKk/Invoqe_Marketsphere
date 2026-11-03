@@ -170,7 +170,13 @@ class EmailService {
    * Brevo allows Single Sender Verification (e.g. verified Gmail address) without requiring a custom domain.
    */
   async _sendViaBrevo(to, subject, html, text) {
-    const apiKey = (process.env.BREVO_API_KEY || '').trim();
+    let apiKey = (process.env.BREVO_API_KEY || '').trim();
+    // Sanitize in case quotes or extra prefix were entered in Render
+    apiKey = apiKey.replace(/^["']|["']$/g, '').trim();
+    if (apiKey.toLowerCase().startsWith('api-key:')) {
+      apiKey = apiKey.substring(8).trim();
+    }
+
     if (!apiKey) {
       return {
         delivered: false,
@@ -179,18 +185,18 @@ class EmailService {
       };
     }
 
-    const defaultSenderEmail = process.env.BREVO_SENDER_EMAIL || process.env.GMAIL_USER || 'no-reply@marketsphere.com';
-    const fromAddress = (process.env.EMAIL_FROM || `MarketSphere <${defaultSenderEmail}>`).trim();
-
-    // Extract sender name and email from "Name <email@domain.com>" or fallback
+    // Robust sender extraction: handles "Name <email@domain.com>", "Name email@domain.com", or standalone email
     let senderName = 'MarketSphere';
-    let senderEmail = defaultSenderEmail;
-    const match = fromAddress.match(/^(?:["']?([^"']*)["']?\s*)?<([^>]+)>/);
-    if (match) {
-      senderName = match[1] ? match[1].trim() : 'MarketSphere';
-      senderEmail = match[2].trim();
-    } else if (fromAddress.includes('@')) {
-      senderEmail = fromAddress;
+    let senderEmail = (process.env.BREVO_SENDER_EMAIL || '').trim().replace(/^["']|["']$/g, '');
+
+    const fromAddress = (process.env.EMAIL_FROM || '').trim();
+    const emailMatch = fromAddress.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+    if (emailMatch) {
+      senderEmail = emailMatch[1].trim();
+      const extractedName = fromAddress.replace(emailMatch[0], '').replace(/[<>"']/g, '').trim();
+      if (extractedName) senderName = extractedName;
+    } else if (!senderEmail) {
+      senderEmail = (process.env.GMAIL_USER || 'no-reply@marketsphere.com').trim();
     }
 
     try {
@@ -225,14 +231,16 @@ class EmailService {
       throw new Error(`Brevo returned HTTP ${response.status}`);
     } catch (err) {
       const status = err.response?.status;
-      const brevoError = err.response?.data?.message || err.message;
+      const brevoData = err.response?.data;
+      const brevoError = brevoData?.message || brevoData?.error || err.message;
+      const brevoCode = brevoData?.code || '';
 
       if (status === 401) {
-        console.error('[EMAIL DISPATCH ERROR] Invalid BREVO_API_KEY. Please verify your API key.');
+        console.error(`[EMAIL DISPATCH ERROR] Brevo 401 Unauthorized: ${brevoError} (code: ${brevoCode})`);
         return {
           delivered: false,
           provider: 'BREVO_HTTPS',
-          error: 'Email authentication failed. Please check provider credentials.'
+          error: `Brevo authentication failed (${brevoError || 'Key not found'}). Make sure you copied an API v3 key (starts with 'xkeysib-') from Brevo's 'API Keys' tab, NOT the SMTP master password.`
         };
       }
 
@@ -240,7 +248,7 @@ class EmailService {
       return {
         delivered: false,
         provider: 'BREVO_HTTPS',
-        error: `Email service unavailable (${brevoError}). Please try again later.`
+        error: `Brevo email dispatch failed (${brevoError}). Please check sender verification in Brevo dashboard.`
       };
     }
   }
